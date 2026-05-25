@@ -1,6 +1,6 @@
 {
   "name": "@supermemory/preprint",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Live markdown projection of a real Chromium browser for AI agents",
   "type": "module",
   "bin": {
