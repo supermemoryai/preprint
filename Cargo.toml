@@ -1,6 +1,6 @@
 [package]
 name = "preprint"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Live markdown projection of a real Chromium browser for AI agents"
 license = "Apache-2.0"
