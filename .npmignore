@@ -1,0 +1,15 @@
+target/
+src/
+agent-browser/
+patches/
+.plan/
+.preprint/
+preprint/
+tests/
+.github/
+.claude/
+.gitignore
+Cargo.toml
+Cargo.lock
+*.log
+.DS_Store

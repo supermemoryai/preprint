@@ -1,0 +1,115 @@
+name: build agent-browser binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "ref of vercel-labs/agent-browser to build against"
+        default: "main"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: darwin-arm64,     target: aarch64-apple-darwin,         runner: macos-14,         cross: false }
+          - { name: darwin-x64,       target: x86_64-apple-darwin,          runner: macos-14,         cross: false }
+          - { name: linux-x64,        target: x86_64-unknown-linux-gnu,     runner: ubuntu-latest,    cross: false }
+          - { name: linux-arm64,      target: aarch64-unknown-linux-gnu,    runner: ubuntu-22.04-arm, cross: false }
+          - { name: linux-musl-x64,   target: x86_64-unknown-linux-musl,    runner: ubuntu-latest,    cross: musl }
+          - { name: linux-musl-arm64, target: aarch64-unknown-linux-musl,   runner: ubuntu-22.04-arm, cross: musl }
+          - { name: win32-x64,        target: x86_64-pc-windows-msvc,       runner: windows-latest,   cross: false }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout preprint (for patches)
+        uses: actions/checkout@v4
+        with:
+          path: preprint
+          sparse-checkout: |
+            patches
+          sparse-checkout-cone-mode: false
+
+      - name: Checkout upstream agent-browser
+        uses: actions/checkout@v4
+        with:
+          repository: vercel-labs/agent-browser
+          ref: ${{ inputs.upstream_ref }}
+          path: agent-browser
+
+      - name: Apply preprint patches
+        working-directory: agent-browser
+        shell: bash
+        run: |
+          for p in ../preprint/patches/agent-browser/*.patch; do
+            echo "applying $p"
+            git apply --whitespace=fix "$p"
+          done
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.cross == 'musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        working-directory: agent-browser/cli
+        env:
+          RUSTFLAGS: "--cap-lints warn"
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          src="agent-browser/cli/target/${{ matrix.target }}/release/agent-browser"
+          out="agent-browser-${{ matrix.name }}"
+          if [ "${{ matrix.name }}" = "win32-x64" ]; then
+            src="${src}.exe"
+            out="${out}.exe"
+          fi
+          mkdir -p out
+          cp "$src" "out/$out"
+          chmod +x "out/$out" || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-browser-${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+
+  commit:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout preprint
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: agent-browser
+          merge-multiple: true
+
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          chmod +x agent-browser/* 2>/dev/null || true
+          git add agent-browser/
+          if git diff --cached --quiet; then
+            echo "no binary changes"
+            exit 0
+          fi
+          git commit -m "ci: refresh agent-browser binaries from upstream ${{ inputs.upstream_ref }}"
+          git push

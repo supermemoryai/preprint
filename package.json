@@ -1,0 +1,44 @@
+{
+  "name": "@supermemory/preprint",
+  "version": "0.1.0",
+  "description": "Live markdown projection of a real Chromium browser for AI agents",
+  "type": "module",
+  "bin": {
+    "preprint": "./bin/preprint.js"
+  },
+  "files": [
+    "bin",
+    "skills",
+    "scripts/postinstall.js",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "version:sync": "node scripts/sync-version.js",
+    "version:check": "node scripts/check-version-sync.js",
+    "version": "npm run version:sync && git add Cargo.toml Cargo.lock",
+    "build:native": "npm run version:sync && cargo build --release --no-default-features"
+  },
+  "license": "Apache-2.0",
+  "author": "Prasanna A P <praveenap0217@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/supermemoryai/preprint.git"
+  },
+  "bugs": {
+    "url": "https://github.com/supermemoryai/preprint/issues"
+  },
+  "homepage": "https://github.com/supermemoryai/preprint",
+  "keywords": [
+    "browser",
+    "automation",
+    "cli",
+    "agent",
+    "ai",
+    "chromium",
+    "markdown"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,194 @@
+From 90894efa16e5c818098eccc10778bc12f3f6ddb9 Mon Sep 17 00:00:00 2001
+From: Prasanna A P <106952318+Prasanna721@users.noreply.github.com>
+Date: Sat, 16 May 2026 12:09:11 -0700
+Subject: [PATCH] Make tab switch foregrounding optional via --no-activate
+
+`agent-browser tab <ref>` bundles two operations: it sets the session's
+active tab pointer (logical select) and it brings the tab to the
+foreground via Page.bringToFront (physical activate). For interactive
+agents that drive one tab at a time this is the right default. For
+background syncers that have to address every tracked tab in turn,
+every cycle calls Page.bringToFront on every tab and steals the user's
+foreground in headed mode.
+
+Add a --no-activate flag to `tab <ref>` that skips the bringToFront
+call but still updates active_page_index and re-enables CDP domains
+on the target session. Default behavior is unchanged.
+
+The internals already attach a per-tab CDP session via
+Target.attachToTarget and store the session_id in PageInfo; the flag
+just makes the existing physical-activate step optional.
+---
+ cli/src/commands.rs       | 49 +++++++++++++++++++++++++++++++++++----
+ cli/src/native/actions.rs |  6 ++++-
+ cli/src/native/browser.rs | 22 +++++++++++-------
+ cli/src/output.rs         |  7 ++++++
+ 4 files changed, 70 insertions(+), 14 deletions(-)
+
+diff --git a/cli/src/commands.rs b/cli/src/commands.rs
+index 3d1b8dd..98db95d 100644
+--- a/cli/src/commands.rs
++++ b/cli/src/commands.rs
+@@ -1261,11 +1261,29 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
+                     }
+                     Ok(cmd)
+                 }
+-                Some(tab_ref) => Ok(json!({
+-                    "id": id,
+-                    "action": "tab_switch",
+-                    "tabId": tab_ref,
+-                })),
++                Some(tab_ref) => {
++                    let mut cmd = json!({
++                        "id": id,
++                        "action": "tab_switch",
++                        "tabId": tab_ref,
++                    });
++                    let mut i = 1;
++                    while i < rest.len() {
++                        match rest[i] {
++                            "--no-activate" => {
++                                cmd["noActivate"] = json!(true);
++                                i += 1;
++                            }
++                            other => {
++                                return Err(ParseError::UnknownSubcommand {
++                                    subcommand: other.to_string(),
++                                    valid_options: &["--no-activate"],
++                                });
++                            }
++                        }
++                    }
++                    Ok(cmd)
++                }
+                 None => Ok(json!({ "id": id, "action": "tab_list" })),
+             }
+         }
+@@ -3414,6 +3432,27 @@ mod tests {
+         assert_eq!(cmd["tabId"], "docs");
+     }
+ 
++    #[test]
++    fn test_tab_switch_no_activate() {
++        let cmd = parse_command(&args("tab t2 --no-activate"), &default_flags()).unwrap();
++        assert_eq!(cmd["action"], "tab_switch");
++        assert_eq!(cmd["tabId"], "t2");
++        assert_eq!(cmd["noActivate"], true);
++    }
++
++    #[test]
++    fn test_tab_switch_default_activates() {
++        let cmd = parse_command(&args("tab t2"), &default_flags()).unwrap();
++        assert_eq!(cmd["action"], "tab_switch");
++        assert!(cmd.get("noActivate").is_none() || cmd["noActivate"] == false);
++    }
++
++    #[test]
++    fn test_tab_switch_unknown_flag_errors() {
++        let result = parse_command(&args("tab t2 --bogus"), &default_flags());
++        assert!(result.is_err(), "unknown flag must error, got: {:?}", result);
++    }
++
+     #[test]
+     fn test_tab_close() {
+         let cmd = parse_command(&args("tab close"), &default_flags()).unwrap();
+diff --git a/cli/src/native/actions.rs b/cli/src/native/actions.rs
+index c86dc23..f6e4c81 100644
+--- a/cli/src/native/actions.rs
++++ b/cli/src/native/actions.rs
+@@ -3727,10 +3727,14 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
+         .ok_or("Missing 'tabId' parameter (expected `t<N>` or a label)")?;
+     let tab_ref = super::browser::TabRef::parse(tab_ref_str)?;
+     let tab_id = mgr.resolve_tab_ref(&tab_ref)?;
++    let activate = !cmd
++        .get("noActivate")
++        .and_then(|v| v.as_bool())
++        .unwrap_or(false);
+     state.ref_map.clear();
+     state.iframe_sessions.clear();
+     state.active_frame_id = None;
+-    let result = mgr.tab_switch_by_id(tab_id).await?;
++    let result = mgr.tab_switch_by_id(tab_id, activate).await?;
+ 
+     if let Some(ref server) = state.stream_server {
+         if let Ok(dims) = mgr
+diff --git a/cli/src/native/browser.rs b/cli/src/native/browser.rs
+index 8e6e1be..f4ba47c 100644
+--- a/cli/src/native/browser.rs
++++ b/cli/src/native/browser.rs
+@@ -1076,7 +1076,7 @@ impl BrowserManager {
+         }))
+     }
+ 
+-    pub async fn tab_switch(&mut self, index: usize) -> Result<Value, String> {
++    pub async fn tab_switch(&mut self, index: usize, activate: bool) -> Result<Value, String> {
+         if index >= self.pages.len() {
+             return Err(format!(
+                 "Tab index {} out of range (0-{})",
+@@ -1089,11 +1089,13 @@ impl BrowserManager {
+         let session_id = self.pages[index].session_id.clone();
+         self.enable_domains(&session_id).await?;
+ 
+-        // Bring tab to front
+-        let _ = self
+-            .client
+-            .send_command("Page.bringToFront", None, Some(&session_id))
+-            .await;
++        if activate {
++            // Bring tab to front
++            let _ = self
++                .client
++                .send_command("Page.bringToFront", None, Some(&session_id))
++                .await;
++        }
+ 
+         let url = self.get_url().await.unwrap_or_default();
+         let title = self.get_title().await.unwrap_or_default();
+@@ -1398,13 +1400,17 @@ impl BrowserManager {
+         Ok(())
+     }
+ 
+-    pub async fn tab_switch_by_id(&mut self, tab_id: u32) -> Result<Value, String> {
++    pub async fn tab_switch_by_id(
++        &mut self,
++        tab_id: u32,
++        activate: bool,
++    ) -> Result<Value, String> {
+         let index = self
+             .pages
+             .iter()
+             .position(|p| p.tab_id == tab_id)
+             .ok_or_else(|| format!("Tab ID {} not found", tab_id))?;
+-        self.tab_switch(index).await
++        self.tab_switch(index, activate).await
+     }
+ 
+     pub async fn tab_close_by_id(&mut self, tab_id: Option<u32>) -> Result<Value, String> {
+diff --git a/cli/src/output.rs b/cli/src/output.rs
+index 09cf679..ceef56b 100644
+--- a/cli/src/output.rs
++++ b/cli/src/output.rs
+@@ -2056,6 +2056,12 @@ Operations:
+   close [t<N>|label]         Close a tab (current if no ref given)
+   <t<N>|label>               Switch to a tab by id or label
+ 
++Switch options:
++  --no-activate              Make the tab current for subsequent commands
++                             without bringing it to the foreground. Useful
++                             for background syncers that need to address a
++                             tab without disturbing the user's focus.
++
+ Global Options:
+   --json               Output as JSON
+   --session <name>     Use specific session
+@@ -2067,6 +2073,7 @@ Examples:
+   agent-browser tab new https://example.com
+   agent-browser tab new --label docs https://docs.example.com
+   agent-browser tab t2
++  agent-browser tab t2 --no-activate
+   agent-browser tab docs
+   agent-browser tab close
+   agent-browser tab close t1
+-- 
+2.54.0
+

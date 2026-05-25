@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  version-sync:
+    name: Version sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: node scripts/check-version-sync.js
+
+  rust:
+    name: Rust (${{ matrix.feature_mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - feature_mode: default
+            cargo_features: ""
+          - feature_mode: no-default-features
+            cargo_features: "--no-default-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --release ${{ matrix.cargo_features }}
+      - name: test
+        run: cargo test --release ${{ matrix.cargo_features }}
+      - name: clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy ${{ matrix.cargo_features }}
+
+  node:
+    name: Node syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: node --check bin/preprint.js
+      - run: node --check scripts/postinstall.js
+      - run: node --check scripts/sync-version.js
+      - run: node --check scripts/check-version-sync.js

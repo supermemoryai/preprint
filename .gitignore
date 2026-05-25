@@ -1,0 +1,9 @@
+.temp/
+.plan/
+preprint/
+.preprint/
+target/
+bin/preprint-*
+bin/agent-browser-*
+node_modules/
+*.tgz

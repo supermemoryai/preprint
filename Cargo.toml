@@ -1,0 +1,36 @@
+[package]
+name = "preprint"
+version = "0.1.0"
+edition = "2024"
+description = "Live markdown projection of a real Chromium browser for AI agents"
+license = "Apache-2.0"
+repository = "https://github.com/supermemoryai/preprint"
+homepage = "https://github.com/supermemoryai/preprint"
+readme = "README.md"
+keywords = ["browser", "automation", "cli", "agent", "ai"]
+categories = ["command-line-utilities", "web-programming"]
+
+[features]
+default = ["embedded-agent-browser"]
+embedded-agent-browser = []
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+diffy = "0.4"
+dirs = "5"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+time = "0.3"
+tokio = { version = "1.48", features = ["macros", "process", "rt-multi-thread", "time", "signal"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+url = "2.5"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,409 @@
+From d9b32be5e77cb27be3c0831858c08c7fb1907670 Mon Sep 17 00:00:00 2001
+From: Prasanna A P <106952318+Prasanna721@users.noreply.github.com>
+Date: Sun, 24 May 2026 22:16:33 -0700
+Subject: [PATCH] console + errors: per-tab buffer routed by CDP session_id
+
+Move EventTracker from DaemonState into PageInfo so each tab owns its own
+console + uncaught-exception ring. CDP loop routes Runtime.consoleAPICalled
+and Runtime.exceptionThrown by event.session_id into the matching page,
+bypassing the active-session filter so background tabs are captured too.
+Iframes (sessions that don't match any page) drop on the floor for now.
+
+handle_console / handle_errors accept an optional "tab": <id> in the cmd
+JSON; with no tab, they fall back to the active page (REPL parity).
+"console --clear" now drains: returns messages then clears the buffer,
+matching how every external poller (preprint included) actually uses it.
+Adds --tab <N> | t<N> to both CLI parsers.
+---
+ cli/src/commands.rs       |  25 ++++++-
+ cli/src/native/actions.rs | 151 ++++++++++++++++++++++++--------------
+ cli/src/native/browser.rs |  27 +++++++
+ cli/src/native/network.rs |   1 +
+ 4 files changed, 148 insertions(+), 56 deletions(-)
+
+diff --git a/cli/src/commands.rs b/cli/src/commands.rs
+index 597b880..a600984 100644
+--- a/cli/src/commands.rs
++++ b/cli/src/commands.rs
+@@ -220,6 +220,25 @@ fn parse_cookie_header(header: &str) -> Result<Vec<Value>, String> {
+     Ok(out)
+ }
+ 
++/// Parse an optional `--tab <id>` flag from a slice of argument tokens.
++/// Accepts bare numerals ("2") or t-prefixed ids ("t2"). Returns None if the
++/// flag is absent.
++fn parse_tab_flag(rest: &[&str], context: &str) -> Result<Option<u32>, ParseError> {
++    let Some(idx) = rest.iter().position(|s| *s == "--tab") else {
++        return Ok(None);
++    };
++    let raw = rest.get(idx + 1).ok_or_else(|| ParseError::MissingArguments {
++        context: context.to_string(),
++        usage: "expected <id> after --tab",
++    })?;
++    let trimmed = raw.strip_prefix('t').unwrap_or(raw);
++    let id: u32 = trimmed.parse().map_err(|_| ParseError::InvalidValue {
++        message: format!("invalid tab id: {raw}"),
++        usage: "--tab <number|tN>",
++    })?;
++    Ok(Some(id))
++}
++
+ pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError> {
+     let mut result = parse_command_inner(args, flags)?;
+ 
+@@ -1477,11 +1496,13 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
+         }
+         "console" => {
+             let clear = rest.contains(&"--clear");
+-            Ok(json!({ "id": id, "action": "console", "clear": clear }))
++            let tab = parse_tab_flag(&rest, "console")?;
++            Ok(json!({ "id": id, "action": "console", "clear": clear, "tab": tab }))
+         }
+         "errors" => {
+             let clear = rest.contains(&"--clear");
+-            Ok(json!({ "id": id, "action": "errors", "clear": clear }))
++            let tab = parse_tab_flag(&rest, "errors")?;
++            Ok(json!({ "id": id, "action": "errors", "clear": clear, "tab": tab }))
+         }
+         "highlight" => {
+             let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
+diff --git a/cli/src/native/actions.rs b/cli/src/native/actions.rs
+index c42634d..e880c10 100644
+--- a/cli/src/native/actions.rs
++++ b/cli/src/native/actions.rs
+@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, oneshot, RwLock};
+ use crate::connection::get_socket_dir;
+ 
+ use super::auth;
+-use super::browser::{should_track_target, BrowserManager, WaitUntil};
++use super::browser::{should_track_target, BrowserManager, PageInfo, WaitUntil};
+ use super::cdp::chrome::LaunchOptions;
+ use super::cdp::client::CdpClient;
+ use super::cdp::types::{
+@@ -207,7 +207,6 @@ pub struct DaemonState {
+     pub backend_type: BackendType,
+     pub ref_map: RefMap,
+     pub domain_filter: Arc<RwLock<Option<DomainFilter>>>,
+-    pub event_tracker: EventTracker,
+     pub session_name: Option<String>,
+     pub session_id: String,
+     pub tracing_state: TracingState,
+@@ -277,7 +276,6 @@ impl DaemonState {
+                     .filter(|s| !s.is_empty())
+                     .map(|s| DomainFilter::new(&s)),
+             )),
+-            event_tracker: EventTracker::new(),
+             session_name: env::var("AGENT_BROWSER_SESSION_NAME").ok(),
+             session_id: env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string()),
+             tracing_state: TracingState::new(),
+@@ -676,6 +674,7 @@ impl DaemonState {
+                         url: te.target_info.url.clone(),
+                         title: te.target_info.title.clone(),
+                         target_type: te.target_info.target_type.clone(),
++                        event_tracker: EventTracker::new(),
+                     });
+                 }
+             }
+@@ -793,6 +792,73 @@ impl DaemonState {
+                         _ => {}
+                     }
+ 
++                    // Per-tab routing for console + exception events: bypass the
++                    // active-session filter so background tabs' logs land in
++                    // their own page.event_tracker. Iframes (and any session
++                    // we can't match to a page) drop on the floor for now.
++                    if event.method == "Runtime.consoleAPICalled" {
++                        let Some(event_sid) = event.session_id.as_deref() else {
++                            continue;
++                        };
++                        let level = event
++                            .params
++                            .get("type")
++                            .and_then(|v| v.as_str())
++                            .unwrap_or("log");
++                        let raw_args: Vec<Value> = event
++                            .params
++                            .get("args")
++                            .and_then(|v| v.as_array())
++                            .cloned()
++                            .unwrap_or_default();
++                        let text = network::format_console_args(&raw_args);
++                        if let Some(ref server) = self.stream_server {
++                            server.broadcast_console(level, &text, &raw_args);
++                        }
++                        if let Some(browser) = self.browser.as_mut() {
++                            if let Some(page) =
++                                browser.page_for_session_mut(event_sid)
++                            {
++                                page.event_tracker.add_console(level, &text, raw_args);
++                            }
++                        }
++                        continue;
++                    }
++                    if event.method == "Runtime.exceptionThrown" {
++                        let Some(event_sid) = event.session_id.as_deref() else {
++                            continue;
++                        };
++                        if let Ok(ex_event) = serde_json::from_value::<ExceptionThrownEvent>(
++                            event.params.clone(),
++                        ) {
++                            let details = &ex_event.exception_details;
++                            let text = details
++                                .exception
++                                .as_ref()
++                                .and_then(|e| e.description.as_deref())
++                                .unwrap_or(&details.text)
++                                .to_string();
++                            if let Some(ref server) = self.stream_server {
++                                server.broadcast_page_error(
++                                    &text,
++                                    details.line_number,
++                                    details.column_number,
++                                );
++                            }
++                            if let Some(browser) = self.browser.as_mut() {
++                                if let Some(page) = browser.page_for_session_mut(event_sid) {
++                                    page.event_tracker.add_error(
++                                        &text,
++                                        None,
++                                        details.line_number,
++                                        details.column_number,
++                                    );
++                                }
++                            }
++                        }
++                        continue;
++                    }
++
+                     let session_matches = if let Some(ref browser) = self.browser {
+                         event.session_id.as_deref() == browser.active_session_id().ok()
+                     } else {
+@@ -814,49 +880,6 @@ impl DaemonState {
+                     }
+ 
+                     match event.method.as_str() {
+-                        "Runtime.consoleAPICalled" => {
+-                            let level = event
+-                                .params
+-                                .get("type")
+-                                .and_then(|v| v.as_str())
+-                                .unwrap_or("log");
+-                            let raw_args: Vec<Value> = event
+-                                .params
+-                                .get("args")
+-                                .and_then(|v| v.as_array())
+-                                .cloned()
+-                                .unwrap_or_default();
+-                            let text = network::format_console_args(&raw_args);
+-                            if let Some(ref server) = self.stream_server {
+-                                server.broadcast_console(level, &text, &raw_args);
+-                            }
+-                            self.event_tracker.add_console(level, &text, raw_args);
+-                        }
+-                        "Runtime.exceptionThrown" => {
+-                            if let Ok(ex_event) =
+-                                serde_json::from_value::<ExceptionThrownEvent>(event.params.clone())
+-                            {
+-                                let details = &ex_event.exception_details;
+-                                let text = details
+-                                    .exception
+-                                    .as_ref()
+-                                    .and_then(|e| e.description.as_deref())
+-                                    .unwrap_or(&details.text);
+-                                self.event_tracker.add_error(
+-                                    text,
+-                                    None,
+-                                    details.line_number,
+-                                    details.column_number,
+-                                );
+-                                if let Some(ref server) = self.stream_server {
+-                                    server.broadcast_page_error(
+-                                        text,
+-                                        details.line_number,
+-                                        details.column_number,
+-                                    );
+-                                }
+-                            }
+-                        }
+                         "Network.requestWillBeSent"
+                             if self.har_recording || self.request_tracking =>
+                         {
+@@ -1322,7 +1345,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
+         "headers" => handle_headers(cmd, state).await,
+         "offline" => handle_offline(cmd, state).await,
+         "console" => handle_console(cmd, state).await,
+-        "errors" => handle_errors(state).await,
++        "errors" => handle_errors(cmd, state).await,
+         "state_save" => handle_state_save(cmd, state).await,
+         "state_load" => handle_state_load(cmd, state).await,
+         "state_list" | "state_show" | "state_clear" | "state_clean" | "state_rename" => {
+@@ -3412,17 +3435,35 @@ async fn handle_offline(cmd: &Value, state: &DaemonState) -> Result<Value, Strin
+ 
+ async fn handle_console(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+     let clear = cmd.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
++    let tab = cmd.get("tab").and_then(|v| v.as_u64()).map(|v| v as u32);
++    let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
++    let page = resolve_page_mut(mgr, tab)?;
++    let result = page.event_tracker.get_console_json();
+     if clear {
+-        state.event_tracker.clear_console();
+-        Ok(json!({ "cleared": true }))
+-    } else {
+-        let result = state.event_tracker.get_console_json();
+-        Ok(result)
++        page.event_tracker.clear_console();
+     }
++    Ok(result)
++}
++
++async fn handle_errors(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
++    let tab = cmd.get("tab").and_then(|v| v.as_u64()).map(|v| v as u32);
++    let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
++    let page = resolve_page_mut(mgr, tab)?;
++    Ok(page.event_tracker.get_errors_json())
+ }
+ 
+-async fn handle_errors(state: &DaemonState) -> Result<Value, String> {
+-    Ok(state.event_tracker.get_errors_json())
++/// Pick the page to operate on: explicit `tab_id` if given, otherwise the
++/// currently active page. Returns an error if neither resolves to a page.
++fn resolve_page_mut(
++    mgr: &mut BrowserManager,
++    tab_id: Option<u32>,
++) -> Result<&mut PageInfo, String> {
++    match tab_id {
++        Some(id) => mgr
++            .page_by_tab_id_mut(id)
++            .ok_or_else(|| format!("Unknown tab id: t{id}")),
++        None => mgr.active_page_mut().ok_or_else(|| "No active page".to_string()),
++    }
+ }
+ 
+ async fn handle_state_save(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+@@ -4190,6 +4231,7 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
+             url: nav_url.clone(),
+             title: String::new(),
+             target_type: "page".to_string(),
++            event_tracker: EventTracker::new(),
+         });
+ 
+         if let Some((w, h, scale, mobile)) = viewport {
+@@ -6378,6 +6420,7 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
+         url: "about:blank".to_string(),
+         title: String::new(),
+         target_type: "page".to_string(),
++        event_tracker: EventTracker::new(),
+     });
+ 
+     if let Some(viewport) = cmd.get("viewport") {
+diff --git a/cli/src/native/browser.rs b/cli/src/native/browser.rs
+index f4ba47c..df06cd7 100644
+--- a/cli/src/native/browser.rs
++++ b/cli/src/native/browser.rs
+@@ -11,6 +11,7 @@ use super::cdp::discovery::discover_cdp_url;
+ use super::cdp::lightpanda::{launch_lightpanda, LightpandaLaunchOptions, LightpandaProcess};
+ use super::cdp::types::*;
+ use super::element::{resolve_element_object_id, RefMap};
++use super::network::EventTracker;
+ 
+ // ---------------------------------------------------------------------------
+ // Launch validation
+@@ -170,8 +171,12 @@ pub struct PageInfo {
+     pub url: String,
+     pub title: String,
+     pub target_type: String, // "page" or "webview"
++    /// Per-tab console + uncaught-exception buffer. The CDP loop routes events
++    /// here by matching `event.session_id` to this page's `session_id`.
++    pub event_tracker: EventTracker,
+ }
+ 
++
+ /// Canonical string form of a stable tab id: `t1`, `t2`, ... The `t` prefix
+ /// disambiguates stable ids from positional indices (which the CLI no longer
+ /// accepts) and matches the `@e<N>` convention used for element refs.
+@@ -477,6 +482,7 @@ impl BrowserManager {
+                 session_id: String::new(),
+                 url: String::new(),
+                 title: String::new(),
++                event_tracker: EventTracker::new(),
+                 target_type: "page".to_string(),
+             });
+             manager.active_page_index = 0;
+@@ -547,6 +553,7 @@ impl BrowserManager {
+                 url: "about:blank".to_string(),
+                 title: String::new(),
+                 target_type: "page".to_string(),
++                event_tracker: EventTracker::new(),
+             });
+             self.active_page_index = 0;
+             self.enable_domains(&attach_result.session_id).await?;
+@@ -574,6 +581,7 @@ impl BrowserManager {
+                     url: target.url.clone(),
+                     title: target.title.clone(),
+                     target_type: target.target_type.clone(),
++                    event_tracker: EventTracker::new(),
+                 });
+             }
+ 
+@@ -649,6 +657,22 @@ impl BrowserManager {
+             .ok_or_else(|| "No active page".to_string())
+     }
+ 
++    /// Mutable lookup of the page whose CDP session_id matches `sid`. Returns
++    /// None if no page owns this session (e.g. cross-origin iframe session).
++    pub fn page_for_session_mut(&mut self, sid: &str) -> Option<&mut PageInfo> {
++        self.pages.iter_mut().find(|p| p.session_id == sid)
++    }
++
++    /// Mutable lookup of the page whose stable tab_id matches.
++    pub fn page_by_tab_id_mut(&mut self, tab_id: u32) -> Option<&mut PageInfo> {
++        self.pages.iter_mut().find(|p| p.tab_id == tab_id)
++    }
++
++    /// Mutable handle to the currently active page.
++    pub fn active_page_mut(&mut self) -> Option<&mut PageInfo> {
++        self.pages.get_mut(self.active_page_index)
++    }
++
+     pub async fn navigate(&mut self, url: &str, wait_until: WaitUntil) -> Result<Value, String> {
+         let session_id = self.active_session_id()?.to_string();
+         let mut lifecycle_rx = self.client.subscribe();
+@@ -923,6 +947,7 @@ impl BrowserManager {
+             url: "about:blank".to_string(),
+             title: String::new(),
+             target_type: "page".to_string(),
++            event_tracker: EventTracker::new(),
+         });
+         self.active_page_index = 0;
+         self.enable_domains(&attach_result.session_id).await?;
+@@ -1065,6 +1090,7 @@ impl BrowserManager {
+             url: target_url.to_string(),
+             title: String::new(),
+             target_type: "page".to_string(),
++            event_tracker: EventTracker::new(),
+         });
+         self.active_page_index = index;
+ 
+@@ -1835,6 +1861,7 @@ mod tests {
+             url: String::new(),
+             title: String::new(),
+             target_type: "page".to_string(),
++            event_tracker: EventTracker::new(),
+         }];
+         let target = TargetInfo {
+             target_id: "popup-1".to_string(),
+diff --git a/cli/src/native/network.rs b/cli/src/native/network.rs
+index 39c69df..1c458dc 100644
+--- a/cli/src/native/network.rs
++++ b/cli/src/native/network.rs
+@@ -370,6 +370,7 @@ pub struct ErrorEntry {
+     pub column: Option<i64>,
+ }
+ 
++#[derive(Debug, Clone)]
+ pub struct EventTracker {
+     pub console_entries: Vec<ConsoleEntry>,
+     pub error_entries: Vec<ErrorEntry>,
+-- 
+2.54.0
+

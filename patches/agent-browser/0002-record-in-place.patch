@@ -1,0 +1,190 @@
+From 301bc31dc98ee5c5c816753a1ab3c3ce9f175989 Mon Sep 17 00:00:00 2001
+From: Prasanna A P <106952318+Prasanna721@users.noreply.github.com>
+Date: Sun, 24 May 2026 00:31:29 -0700
+Subject: [PATCH] Add --in-place flag to record start
+
+---
+ cli/src/commands.rs       | 62 +++++++++++++++++++++++++++++++++++++--
+ cli/src/native/actions.rs | 33 +++++++++++++++++++++
+ cli/src/output.rs         | 16 ++++++++--
+ 3 files changed, 105 insertions(+), 6 deletions(-)
+
+diff --git a/cli/src/commands.rs b/cli/src/commands.rs
+index 98db95d..597b880 100644
+--- a/cli/src/commands.rs
++++ b/cli/src/commands.rs
+@@ -1414,10 +1414,10 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
+                 Some("start") => {
+                     let path = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                         context: "record start".to_string(),
+-                        usage: "record start <output.webm> [url]",
++                        usage: "record start <output.webm> [url] [--in-place]",
+                     })?;
+-                    // Optional URL parameter
+-                    let url = rest.get(2);
++                    // Optional URL parameter (positional, must not start with --)
++                    let url = rest.get(2).filter(|s| !s.starts_with("--"));
+                     let mut cmd = json!({ "id": id, "action": "recording_start", "path": path });
+                     if let Some(u) = url {
+                         // Add https:// prefix if needed (preserve special schemes)
+@@ -1428,6 +1428,21 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
+                         };
+                         cmd["url"] = json!(url_str);
+                     }
++                    let mut i = if url.is_some() { 3 } else { 2 };
++                    while i < rest.len() {
++                        match rest[i] {
++                            "--in-place" => {
++                                cmd["inPlace"] = json!(true);
++                                i += 1;
++                            }
++                            other => {
++                                return Err(ParseError::UnknownSubcommand {
++                                    subcommand: other.to_string(),
++                                    valid_options: &["--in-place"],
++                                });
++                            }
++                        }
++                    }
+                     Ok(cmd)
+                 }
+                 Some("stop") => Ok(json!({ "id": id, "action": "recording_stop" })),
+@@ -3934,6 +3949,47 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn test_record_start_in_place() {
++        let cmd = parse_command(
++            &args("record start output.webm --in-place"),
++            &default_flags(),
++        )
++        .unwrap();
++        assert_eq!(cmd["action"], "recording_start");
++        assert_eq!(cmd["path"], "output.webm");
++        assert_eq!(cmd["inPlace"], true);
++        assert!(cmd.get("url").is_none());
++    }
++
++    #[test]
++    fn test_record_start_in_place_with_url() {
++        let cmd = parse_command(
++            &args("record start demo.webm https://example.com --in-place"),
++            &default_flags(),
++        )
++        .unwrap();
++        assert_eq!(cmd["action"], "recording_start");
++        assert_eq!(cmd["path"], "demo.webm");
++        assert_eq!(cmd["url"], "https://example.com");
++        assert_eq!(cmd["inPlace"], true);
++    }
++
++    #[test]
++    fn test_record_start_default_no_in_place() {
++        let cmd = parse_command(&args("record start output.webm"), &default_flags()).unwrap();
++        assert!(cmd.get("inPlace").is_none() || cmd["inPlace"] == false);
++    }
++
++    #[test]
++    fn test_record_start_unknown_flag_errors() {
++        let result = parse_command(
++            &args("record start output.webm --bogus"),
++            &default_flags(),
++        );
++        assert!(result.is_err());
++    }
++
+     #[test]
+     fn test_record_stop() {
+         let cmd = parse_command(&args("record stop"), &default_flags()).unwrap();
+diff --git a/cli/src/native/actions.rs b/cli/src/native/actions.rs
+index f6e4c81..c42634d 100644
+--- a/cli/src/native/actions.rs
++++ b/cli/src/native/actions.rs
+@@ -4041,6 +4041,39 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
+         .and_then(|v| v.as_str())
+         .filter(|s| !s.is_empty());
+ 
++    let in_place = cmd
++        .get("inPlace")
++        .and_then(|v| v.as_bool())
++        .unwrap_or(false);
++
++    if in_place {
++        let (client, session_id) = {
++            let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
++            let active_session_id = mgr.active_session_id()?.to_string();
++            if let Some(u) = recording_url {
++                let _ = mgr
++                    .client
++                    .send_command(
++                        "Page.navigate",
++                        Some(json!({ "url": u })),
++                        Some(&active_session_id),
++                    )
++                    .await;
++                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
++            }
++            (mgr.client.clone(), active_session_id)
++        };
++
++        let result = recording::recording_start(&mut state.recording_state, path)?;
++        state.start_recording_task(client, session_id).await?;
++
++        if let Some(ref server) = state.stream_server {
++            server.set_recording(true, &state.engine).await;
++        }
++
++        return Ok(result);
++    }
++
+     let viewport = state.viewport;
+ 
+     let (client, new_session_id) = {
+diff --git a/cli/src/output.rs b/cli/src/output.rs
+index ceef56b..af91eeb 100644
+--- a/cli/src/output.rs
++++ b/cli/src/output.rs
+@@ -2284,19 +2284,26 @@ The output file can be viewed in:
+             r##"
+ agent-browser record - Record browser session to video
+ 
+-Usage: agent-browser record start <path.webm> [url]
++Usage: agent-browser record start <path.webm> [url] [--in-place]
+        agent-browser record stop
+        agent-browser record restart <path.webm> [url]
+ 
+ Record the browser to a WebM video file.
+-Creates a fresh browser context but preserves cookies and localStorage.
+-If no URL is provided, automatically navigates to your current page.
++By default, creates a fresh browser context (preserves cookies and localStorage).
++With --in-place, records the current tab in place (preserves full DOM/scroll/form state).
++If no URL is provided, navigates to (or stays on) your current page.
+ 
+ Operations:
+   start <path> [url]     Start recording (defaults to current URL if omitted)
+   stop                   Stop recording and save video
+   restart <path> [url]   Stop current recording (if any) and start a new one
+ 
++Start Options:
++  --in-place             Record the current tab in place instead of creating
++                         a fresh context. Preserves full state: DOM mutations,
++                         scroll position, form input, sessionStorage, focused
++                         element. URL arg (if given) navigates the current tab.
++
+ Global Options:
+   --json               Output as JSON
+   --session <name>     Use specific session
+@@ -2312,6 +2319,9 @@ Examples:
+   # Or specify a different URL
+   agent-browser record start ./demo.webm https://example.com
+ 
++  # Record the current tab in place (no new context)
++  agent-browser record start ./demo.webm --in-place
++
+   # Restart recording with a new file (stops previous, starts new)
+   agent-browser record restart ./take2.webm
+ "##
+-- 
+2.54.0
+
