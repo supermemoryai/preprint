@@ -1,6 +1,12 @@
 # Changelog
 
 <!-- release:start -->
+## 0.1.2 (2026-05-26)
+
+- Fix npm trusted publishing by using the current Node/npm toolchain.
+- Move release builds to tag/manual dispatch so normal main pushes run CI only.
+- Validate release tags and exact npm package versions before publishing.
+
 ## 0.1.0 (2026-05-25)
 
 First public release.
