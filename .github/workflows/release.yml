@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
@@ -25,23 +25,30 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          node scripts/check-version-sync.js
+
           LOCAL=$(node -p "require('./package.json').version")
           echo "Local version: $LOCAL"
+          TAG="v$LOCAL"
 
-          NPM=$(npm view @supermemory/preprint version 2>/dev/null || echo "0.0.0")
-          echo "npm version: $NPM"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ "${GITHUB_REF_NAME:-}" != "$TAG" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version $LOCAL"
+            exit 1
+          fi
 
-          if [ "$LOCAL" != "$NPM" ]; then
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-            echo "needs_github_release=true" >> "$GITHUB_OUTPUT"
-          else
+          NPM=$(npm view "@supermemory/preprint@$LOCAL" version 2>/dev/null || true)
+          if [ -n "$NPM" ]; then
+            echo "npm version: $NPM"
             echo "should_release=false" >> "$GITHUB_OUTPUT"
-            TAG="v$LOCAL"
-            if gh release view "$TAG" &>/dev/null; then
-              echo "needs_github_release=false" >> "$GITHUB_OUTPUT"
-            else
-              echo "needs_github_release=true" >> "$GITHUB_OUTPUT"
-            fi
+          else
+            echo "npm version: <not published>"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if gh release view "$TAG" &>/dev/null; then
+            echo "needs_github_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_github_release=true" >> "$GITHUB_OUTPUT"
           fi
           echo "version=$LOCAL" >> "$GITHUB_OUTPUT"
 
@@ -116,10 +123,11 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
 
       - uses: actions/download-artifact@v4
         with:
@@ -169,12 +177,16 @@ jobs:
           echo "All 14 binaries present."
 
       - name: Publish
-        run: npm publish --provenance --access public
+        run: npm publish --access public
 
   github-release:
     name: GitHub release
-    needs: [check-release, build]
-    if: always() && needs.build.result == 'success' && needs.check-release.outputs.needs_github_release == 'true'
+    needs: [check-release, build, publish]
+    if: >-
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.publish.result == 'success' || needs.publish.result == 'skipped') &&
+      needs.check-release.outputs.needs_github_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
