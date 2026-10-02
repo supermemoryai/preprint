@@ -13,7 +13,7 @@ concurrency:
 jobs:
   version-sync:
     name: Version sync
-    runs-on: ubuntu-latest
+    runs-on: "peak-ubuntu-24.04-4"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,7 +23,7 @@ jobs:
 
   rust:
     name: Rust (${{ matrix.feature_mode }})
-    runs-on: ubuntu-latest
+    runs-on: "peak-ubuntu-24.04-4"
     strategy:
       fail-fast: false
       matrix:
@@ -48,7 +48,7 @@ jobs:
 
   node:
     name: Node syntax
-    runs-on: ubuntu-latest
+    runs-on: "peak-ubuntu-24.04-4"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

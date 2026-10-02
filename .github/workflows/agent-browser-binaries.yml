@@ -19,10 +19,10 @@ jobs:
         include:
           - { name: darwin-arm64,     target: aarch64-apple-darwin,         runner: macos-14,         cross: false }
           - { name: darwin-x64,       target: x86_64-apple-darwin,          runner: macos-14,         cross: false }
-          - { name: linux-x64,        target: x86_64-unknown-linux-gnu,     runner: ubuntu-latest,    cross: false }
-          - { name: linux-arm64,      target: aarch64-unknown-linux-gnu,    runner: ubuntu-22.04-arm, cross: false }
-          - { name: linux-musl-x64,   target: x86_64-unknown-linux-musl,    runner: ubuntu-latest,    cross: musl }
-          - { name: linux-musl-arm64, target: aarch64-unknown-linux-musl,   runner: ubuntu-22.04-arm, cross: musl }
+          - { name: linux-x64,        target: x86_64-unknown-linux-gnu,     runner: "peak-ubuntu-24.04-4",    cross: false }
+          - { name: linux-arm64,      target: aarch64-unknown-linux-gnu,    runner: "peak-ubuntu-24.04-arm-4", cross: false }
+          - { name: linux-musl-x64,   target: x86_64-unknown-linux-musl,    runner: "peak-ubuntu-24.04-4",    cross: musl }
+          - { name: linux-musl-arm64, target: aarch64-unknown-linux-musl,   runner: "peak-ubuntu-24.04-arm-4", cross: musl }
           - { name: win32-x64,        target: x86_64-pc-windows-msvc,       runner: windows-latest,   cross: false }
     runs-on: ${{ matrix.runner }}
     steps:
@@ -87,7 +87,7 @@ jobs:
 
   commit:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: "peak-ubuntu-24.04-4"
     steps:
       - name: Checkout preprint
         uses: actions/checkout@v4
